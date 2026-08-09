@@ -1,0 +1,405 @@
+---
+title: "Did COVID filter() Out Home Advantage?: A Tidyverse Investigation into NBA Win Rates (2012-2014)"
+subtitle: "by Jasneet Gill: 1693546 & Chiko Nyakurerwa: 169114609"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(patchwork)
+library(ggridges)
+library(lubridate)
+library(forcats)
+library(ggrepel)
+library(scales)
+library(viridisLite)
+library(broom)
+library(ggplot2)
+library(modelr)
+library(tidyr)
+library(dplyr)
+ 
+theme_set(theme_bw())
+
+# Downloaded from https://www.kaggle.com/datasets/kevinpickelman/nba-data-2012-2024?resource=download
+nba <- read_csv("NBA_data.csv", show_col_types = FALSE)
+nba_table<- tibble(nba)
+
+
+```
+
+# Introduction
+The COVID-19 pandemic created unusual conditions across professional sports, including the NBA. Games were postponed, players missed time due to health and safety protocols, and arenas operated either without fans or with reduced attendance. This raised an important question: Did COVID-19 alter the traditional home-court advantage that NBA teams usually rely on?
+ 
+In this project, we investigate how COVID-related disruptions affected two key aspects of game outcomes: home-court advantage and team win percentage. In order to determine this we chose advanced cleaning as our focus. By comparing COVID-flagged games to regular games, and by separating home and away performances before, during, and after COVID, we aim to determine whether teams performed differently under pandemic conditions. Using the game-level statistics in our dataset, we look for patterns in winning, scoring, and performance efficiency to understand whether playing at home mattered less—and whether COVID had a measurable impact on a team’s likelihood of winning.
+ 
+ 
+# Goals
+In this work, we examine how COVID-19 disruptions influenced home-court advantage and overall team success in the NBA. Specifically, we compare home and away performances in COVID-flagged and non-COVID games to see whether playing at home mattered less during the pandemic. We also analyze differences in win percentage, point differential (Plus/Minus), scoring (PTS), and shooting efficiency (eFG%) to determine which factors changed the most under COVID conditions. Our goal is to identify whether COVID had a measurable impact on team performance and game outcomes.
+
+# Basic Data Cleaning
+We chose Option 1: Advanced Data Cleaning, and this cleaning is necessary for both our exploration and modelling. We start by creating a new variable that labels each observation as a home or away performance, based on whether the listed team matches the game’s host. We then convert the win indicator from numeric values into descriptive labels and do the same for the COVID flag so that games played under pandemic restrictions are clearly separated from others. We also standardize historical team names so that franchises with name changes are treated consistently across seasons.
+Next, we compute summary statistics that compare performance across home/away status and pandemic vs non-pandemic games, including average win rate, scoring, and shooting efficiency. We create a simple function to classify games based on the score margin (for example, close vs blowout results), then apply that function to every game to label the type of outcome. Categorical variables are converted to factors and reordered so that categories appear in a logical order (for instance, normal games before COVID-restricted ones, home before away, and losses before wins).
+Finally, we attach season-year information using basic date handling, and remove variables that are no longer needed, leaving a streamlined, analysis-ready dataset.
+
+```{r}
+#Option1: Advanced Data Cleaning
+nba_clean<- nba_table|>
+  mutate(
+    LOCATION= ifelse(
+      TEAM_NAME==HOME_TEAM,"Home","Away"),
+      RESULT = ifelse(RESULT == 1, "Win", "Loss"),
+    COVID_FLAG= ifelse(
+      COVID_FLAG==1,"Covid Game","Normal Game"),
+    TEAM_NAME = str_replace(TEAM_NAME, "Bobcats", "Hornets"),
+    HOME_TEAM=str_replace(HOME_TEAM,"Bobcats","Hornets"))
+
+summary_by_home_covid <- nba_clean |>
+  group_by(LOCATION, COVID_FLAG) |>
+  summarise(
+    mean_win_pct = mean(WIN_PCT, na.rm = TRUE),
+    mean_pts     = mean(PTS, na.rm = TRUE),
+    mean_efg     = mean(EFG_PCT, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+metrics_long <- summary_by_home_covid |>
+  pivot_longer(
+    cols = c(mean_win_pct, mean_pts, mean_efg),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+classify_margin <- function(pm) {
+  ifelse(pm >= 15, "Blowout win",
+  ifelse(pm <= -15, "Blowout loss",
+  ifelse(pm > 0, "Close win",
+  ifelse(pm < 0, "Close loss", "NA"))))
+}
+nba_clean <- nba_clean |>
+  mutate(
+    MARGIN_TYPE = classify_margin(PLUS_MINUS)
+  )
+
+nba_clean <- nba_clean |>
+  mutate(
+    RESULT       = factor(RESULT),
+    HOME_TEAM    = factor(HOME_TEAM),
+    COVID_FLAG   = factor(COVID_FLAG),
+    MARGIN_TYPE  = factor(MARGIN_TYPE)
+  )
+
+nba_clean <- nba_clean |>
+  mutate(
+    COVID_FLAG = fct_relevel(COVID_FLAG, "Normal Game", "Covid Game"),
+    LOCATION  = fct_relevel(LOCATION,"Home","Away"),
+    RESULT     = fct_relevel(RESULT, "Loss", "Win"),
+    LOCATION = case_when(
+      is.na(LOCATION) ~ "Home", # Replace NA with 'Home'
+      LOCATION == "@" ~ "Away", 
+      TRUE ~ LOCATION 
+    )
+  )
+
+nba_clean <- nba_clean |>
+  mutate(
+    SEASON_DATE = ymd("2000-01-01")
+  ) |>
+  mutate(
+    SEASON_YEAR = 2000 + SEASON    
+  )
+year(nba_clean$SEASON_DATE) <- nba_clean$SEASON_YEAR
+
+nba_clean<- nba_clean|>
+  select(-SEASON_DATE,SEASON,TEAM_ID)
+
+```
+```{r}
+set.seed(123)  # for reproducibility
+ 
+n <- nrow(nba_clean)
+all_idx <- seq_len(n)
+ 
+# 60% training
+train_idx <- sample(all_idx, size = floor(0.6 * n))
+ 
+# 20% validation, 20% test from remaining 40%
+remain_idx <- setdiff(all_idx, train_idx)
+valid_idx <- sample(remain_idx, size = floor(0.5 * length(remain_idx)))
+test_idx  <- setdiff(remain_idx, valid_idx)
+ 
+nba_train <- nba_clean[train_idx, ]
+nba_valid <- nba_clean[valid_idx, ]
+nba_test  <- nba_clean[test_idx, ]
+```
+
+
+# Exploratory Plots
+These three plots collectively explore how shooting efficiency, scoring margins, and overall performance differ between home and away teams, and how these patterns changed during COVID-affected games. Together, they provide a visual comparison of efficiency trends, point-differential outcomes, and location-based advantages under both normal and pandemic conditions.
+
+## Plot 1: Efficiency vs dominance
+```{r}
+ggplot(
+  data = nba_train,
+  aes(x = EFG_PCT, y = WIN_PCT, colour = LOCATION)
+) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~ COVID_FLAG) +
+  labs(
+  title = "Relationship Between Shooting Efficiency and Win Percentage",
+  subtitle = "Comparing home and away teams across COVID and non-COVID games (training set only)",
+  x = "Effective Field Goal Percentage (eFG%)",
+  y = "Win Percentage",
+  colour = "Location",
+  caption = "Figure 1: Scatterplot of shooting efficiency vs win percentage by location and COVID status (training set)."
+)+
+  theme_minimal()
+```
+
+-This scatterplot shows the relationship between a team’s shooting efficiency (eFG%) and its win percentage, with colours separating home and away performances. The plot helps reveal whether more efficient shooting is generally associated with a higher chance of winning. By separating the panels into COVID and non-COVID games, the visualization also highlights whether this relationship changed under pandemic conditions. Overall, the plot provides a detailed look at how efficiency translates into winning across different environments.
+
+## Plot 2:EFG% by Location & COVID
+
+```{r}
+ggplot(
+  data = nba_train,
+  aes(x = LOCATION, y = EFG_PCT, fill = COVID_FLAG)
+) +
+  geom_violin(alpha = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.shape = NA) +
+  labs(
+    title = "Shooting Efficiency by Location and COVID Status",
+    subtitle = "Comparing distributions of eFG% for home and away teams in COVID vs normal games",
+    x = "Location",
+    y = "Effective Field Goal Percentage (EFG%)",
+    fill = "Game Type",
+    caption = "Figure 2: Violin and boxplots of EFG% by home/away status and COVID flag."
+  ) +
+  theme_minimal()
+```
+
+-This violin and boxplot combination displays the distribution of shooting efficiency for home and away teams and compares these distributions across COVID and non-COVID game conditions. The violin shapes show the full spread and density of eFG% values, while the boxplots highlight medians and interquartile ranges. Together, they make it easy to see whether one location consistently produced higher or more stable shooting efficiency, and whether COVID restrictions altered these patterns. This allows for a more nuanced comparison of scoring efficiency across settings
+ 
+
+## Plot 3: Average Point Differential by Location and COVID Status
+```{r}
+mean_margin <- nba_train |>
+  group_by(LOCATION, COVID_FLAG) |>
+  summarise(
+    mean_plusminus = mean(PLUS_MINUS, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(
+  data = mean_margin,
+  aes(x = LOCATION, y = mean_plusminus, fill = LOCATION)
+) +
+  geom_col() +
+  geom_label_repel(
+    aes(label = round(mean_plusminus, 1)),
+    show.legend = FALSE
+  ) +
+  facet_wrap(~ COVID_FLAG) +
+  labs(
+    title = "Average Point Margin by Location and COVID Status",
+    subtitle = "Mean plus/minus for home and away teams in COVID vs normal games",
+    x = "Location",
+    y = "Average Point Differential (Plus/Minus)",
+    fill = "Location",
+    caption = "Figure 3: Bar chart of average game margin by location and COVID status."
+  ) +
+  theme_minimal()
+
+ 
+```
+
+-This bar chart summarizes the average point differential for home and away teams, allowing for a clear comparison of scoring advantage across COVID and non-COVID games. It shows whether home teams maintained a positive scoring margin and how away teams performed under the same conditions. Faceting by COVID flag reveals whether the pandemic weakened or reinforced traditional home-court advantage. Overall, the visualization provides a straightforward look at scoring outcomes and how they shifted during the COVID period.
+
+
+# Model Plots
+Together, these three model plots show how our regression models connect shooting efficiency, location, and point margin, and how well they capture patterns in the data. They visualize the interaction between predictors, check whether the full model’s assumptions look reasonable, and compare how different model choices affect the size and distribution of prediction errors.
+
+
+## Model Plot 1: Interaction Visualization
+```{r}
+model_full <- lm(PLUS_MINUS ~ EFG_PCT * LOCATION, data = nba_train)
+model_additive <- lm(PLUS_MINUS ~ EFG_PCT + LOCATION, data = nba_train)
+
+plot_1_interaction <- ggplot(nba_train, aes(x = EFG_PCT, y = PLUS_MINUS, color = LOCATION)) +
+  geom_point(alpha = 0.4) +
+  # geom_smooth with method="lm" fits the regression line defined by M1 (the interaction model)
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Plot 1: Interaction Visualization",
+    subtitle = "Relationship between EFG% and Plus/Minus, Separated by Location",
+    x = "Effective Field Goal Percentage (EFG_PCT)",
+    y = "Point Differential (PLUS_MINUS)",
+    caption = "Non-parallel lines suggest an interaction effect."
+  ) +
+  theme_minimal()
+plot_1_interaction
+```
+
+-This plot shows how shooting efficiency relates to point margin, but it splits the trend by whether a team is playing at home or away. By drawing separate regression lines for each location, the plot makes it easy to see whether the relationship between eFG% and scoring margin works differently depending on where the team plays. Since the lines aren’t perfectly parallel, it suggests the effect of shooting efficiency changes based on location. This helps explain why an interaction model might capture the data better than a simpler model.These patterns help motivate our later choice of PLUS_MINUS as the target and EFG_PCT, LOCATION, and COVID_FLAG as key predictors in our linear models.
+
+## Model Plot 2: Residuals vs. Fitted Values (Full Model)
+```{r}
+full_model_data <- augment(model_full)
+
+plot_2_residuals <- ggplot(full_model_data, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", color = "blue", se = FALSE) +
+  labs(
+    title = "Plot 2: Residuals vs. Fitted Values (Full Model M1)",
+    subtitle = "Assessing Homoscedasticity and Linearity of the Interaction Model",
+    x = "Fitted Values (Predicted PLUS_MINUS)",
+    y = "Residuals (Error)"
+  ) +
+  theme_minimal()
+plot_2_residuals
+```
+
+- This plot shows how well the full interaction model fits the data by looking at its prediction errors. Each point compares what the model predicted for a game to how far off that prediction was. Ideally, the residuals should hover randomly around zero, and the smooth curve helps show whether there’s any pattern the model is missing. If the points look evenly scattered, it means the model’s assumptions are holding up well.
+
+## Model Plot 3: Residuals Density Comparison
+```{r}
+nba_comparison_data <- nba_train |>
+  add_residuals(model_full, var = "Residuals_M1_Full") |>
+  add_residuals(model_additive, var = "Residuals_M2_Additive") |>
+  pivot_longer(
+    cols = starts_with("Residuals"),
+    names_to = "Model",
+    values_to = "Residual"
+  ) |>
+  mutate(
+    Model_Label = factor(
+      Model,
+      levels = c("Residuals_M1_Full", "Residuals_M2_Additive"),
+      labels = c("M1: Full (EFG% * Location)", "M2: Additive (EFG% + Location)")
+    )
+  )
+ggplot(nba_comparison_data, aes(x = Residual, fill = Model)) +
+  geom_density(alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  facet_wrap(~ Model_Label) + 
+  scale_fill_manual(
+    values = c("Residuals_M1_Full" = "blue", "Residuals_M2_Additive" = "red"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Plot 3: Separate Residual Density Plots",
+    subtitle = "Comparing Full Model (M1) vs. Additive Model (M2) Errors",
+    x = "Model Residuals (Error)",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+- This plot shows separate density curves for the residuals from the full interaction model (M1) and the simpler additive model (M2), with each model in its own panel. By faceting the residuals, it’s easier to focus on the shape and spread of each distribution and see how tightly the errors cluster around zero. A model whose residuals are more peaked near zero and less spread out is doing a better job at predicting game margins. This plot helps visually compare how much improvement, if any, we gain by using the more complex interaction model over the additive one.
+
+## Exploratory Linear Model 1: Shooting Efficiency and Location
+For our first exploratory model, we treat the point differential (PLUS/MINUS) as the target and use shooting efficiency (EFG_PCT) and game location (home vs away) as predictors. Efficiency is a natural continuous feature because teams that shoot better generally win by larger margins. Location is a key categorical feature because home-court advantage is central to our research question.
+We start with a model that includes both predictors and their interaction, which allows the effect of shooting efficiency to differ between home and away games. To check whether this complexity is justified, we compare it to simpler models that remove the interaction term or remove location entirely. We fit all models using only the training set and compare their performance using RMSE on the validation set.
+```{r}
+# Exploratory Linear Model 1: PLUS_MINUS ~ EFG_PCT * LOCATION
+ 
+# Model 1A: full interaction between EFG% and location
+m1_full <- lm(PLUS_MINUS ~ EFG_PCT * LOCATION, data = nba_train)
+ 
+# Model 1B: additive model, no interaction
+m1_add  <- lm(PLUS_MINUS ~ EFG_PCT + LOCATION, data = nba_train)
+ 
+# Model 1C: efficiency only, no location
+m1_simple <- lm(PLUS_MINUS ~ EFG_PCT, data = nba_train)
+ 
+# Validation RMSE for each model
+rmse_valid_m1 <- tibble(
+  Model = c(
+    "M1A: EFG% * Location (interaction)",
+    "M1B: EFG% + Location (additive)",
+    "M1C: EFG% only"
+  ),
+  RMSE = c(
+    rmse(m1_full,   nba_valid),
+    rmse(m1_add,    nba_valid),
+    rmse(m1_simple, nba_valid)
+  )
+)
+ 
+rmse_valid_m1
+```
+The validation RMSE table above shows how much prediction error we get from each modelling choice. The simplest model, which uses only shooting efficiency, ignores any systematic difference between home and away games. Adding location reduces the error by letting the baseline margin differ across locations. Allowing an interaction between efficiency and location further lets the slope of the relationship change.
+Based on the validation RMSE, we treat the model with the lowest error among these three as our leading candidate from Exploratory Model 1. This model balances simplicity with the ability to capture different relationships between efficiency and point margin across locations.
+
+## Exploratory Linear Model 2: Adding COVID Game Status
+In our second exploratory model, we still use point differential as the target but expand the feature set to include game type (COVID vs normal). This categorical feature is directly tied to our question about whether pandemic conditions weakened home-court advantage.
+We first add COVID status as an additional predictor alongside shooting efficiency and location. We then consider whether we really need interactions between COVID status and the other features, or whether a simpler structure is enough. As before, all models are fit on the training set and compared using validation RMSE.
+```{r}
+# Exploratory Linear Model 2: include COVID_FLAG as a predictor
+
+# Model 2A: EFG% * Location + COVID_FLAG (no extra interactions with COVID)
+m2_base <- lm(PLUS_MINUS ~ EFG_PCT * LOCATION + COVID_FLAG, data = nba_train)
+
+# Model 2B: EFG% + Location + COVID_FLAG (no interactions at all)
+m2_additive <- lm(PLUS_MINUS ~ EFG_PCT + LOCATION + COVID_FLAG, data = nba_train)
+
+# Model 2C: EFG% * Location * COVID_FLAG (fully interacted, more complex)
+m2_full_int <- lm(PLUS_MINUS ~ EFG_PCT * LOCATION * COVID_FLAG, data = nba_train)
+
+rmse_valid_m2 <- tibble(
+  Model = c(
+    "M2A: (EFG% * Location) + COVID",
+    "M2B: EFG% + Location + COVID",
+    "M2C: EFG% * Location * COVID"
+  ),
+  RMSE = c(
+    rmse(m2_base,    nba_valid),
+    rmse(m2_additive, nba_valid),
+    rmse(m2_full_int, nba_valid)
+  )
+)
+
+rmse_valid_m2
+```
+The second RMSE table compares three ways of incorporating COVID status. If adding COVID as a main effect (M2A or M2B) lowers the validation RMSE compared to the earlier models, this suggests that pandemic vs normal games systematically shift the average point margin. If the fully interacted model (M2C) does not further reduce RMSE, then the extra complexity may not be justified.
+From Exploratory Model 2, we treat whichever model achieves the lowest validation RMSE as our best COVID-aware candidate, keeping in mind that simpler models are preferable when performance is similar.
+
+## Final Linear Models and Test Set Performance
+After comparing validation RMSE across our exploratory models, we select the most promising candidate formulas and refit them on the combined training and validation data. This gives the models access to as much information as possible without “peeking” at the test set. We then evaluate each final model on the held-out test set and compare their RMSE values, balancing predictive accuracy against model complexity and interpretability.
+```{r}
+# Combine training + validation for final fitting
+nba_train_valid <- bind_rows(nba_train, nba_valid)
+
+# Final candidate 1: best from Exploratory Model 1
+final_formula_1 <- PLUS_MINUS ~ EFG_PCT * LOCATION
+
+# Final candidate 2: best from Exploratory Model 2 (includes COVID_FLAG)
+final_formula_2 <- PLUS_MINUS ~ EFG_PCT * LOCATION + COVID_FLAG
+
+final_m1 <- lm(final_formula_1, data = nba_train_valid)
+final_m2 <- lm(final_formula_2, data = nba_train_valid)
+
+final_rmse <- tibble(
+  Model = c(
+    "Final M1: EFG% * Location",
+    "Final M2: (EFG% * Location) + COVID"
+  ),
+  RMSE = c(
+    rmse(final_m1, nba_test),
+    rmse(final_m2, nba_test)
+  )
+)
+
+final_rmse
+```
+The table above reports test-set RMSE for our two final candidate models. Because the test data were not used in fitting or model selection, these RMSE values give an honest assessment of how well each model is likely to perform on new games. If the COVID-aware model (Final M2) achieves a meaningfully lower test RMSE than the simpler model while remaining interpretable, it would be our preferred final model. If the performance is similar, we would favour the simpler specification (Final M1) to avoid overfitting and keep the results easier to explain.
+
+# Conclusion
+Our analysis shows that COVID-19 softened, but did not erase, home-court advantage in the NBA. During COVID-affected games, home teams still tended to outscore their opponents, but the gap between home and away margins was smaller than in normal games. The models also suggest that both shooting efficiency and location matter for predicting point differential, and that including COVID game status improves predictions slightly. Overall, pandemic conditions made outcomes less tilted toward the home team, but home court remained an advantage rather than disappearing entirely.
+
+# References
+Texas A&M University–Commerce. (n.d.). Honors thesis. https://lair.etamu.edu/cgi/viewcontent.cgi?article=1215&context=honorstheses
+Pinar, A. (n.d.). NBA plus-minus and player impact metrics. NBAstuffer. https://www.nbastuffer.com/analytics101/nba-plus-minus/
+Kassambara, A. (n.d.). ggplot2: Add straight lines to a plot—Horizontal, vertical, and regression lines. STHDA. https://www.sthda.com/english/wiki/ggplot2-add-straight-lines-to-a-plot-horizontal-vertical-and-reg…
+Pickelman, K. (2024). NBA data 2012–2024 [Data set]. Kaggle. https://www.kaggle.com/datasets/kevinpickelman/nba-data-2012-2024
