@@ -1,6 +1,6 @@
 ---
 title: "Did COVID filter() Out Home Advantage?: A Tidyverse Investigation into NBA Win Rates (2012-2014)"
-subtitle: "by Jasneet Gill: 1693546 & Chiko Nyakurerwa: 169114609"
+subtitle: "by Jasneet Gill"
 output: pdf_document
 ---
 
